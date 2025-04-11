@@ -200,9 +200,17 @@ class SpeechService {
 
       // Prepare request body with streaming flag
       final requestBody = jsonEncode({
-        'model': 'gpt-4',
-        'messages': formattedMessages,
+        'model': 'gpt-3.5-turbo',
+        'messages': [
+          {
+            'role': 'system',
+            'content':
+                'You are a helpful AI assistant. Please keep your responses concise and to the point. Aim for 1-2 sentences when possible.',
+          },
+          ...formattedMessages,
+        ],
         'stream': true,
+        'max_tokens': 150, // Limit response length
       });
 
       request.write(requestBody);
@@ -321,25 +329,55 @@ class SpeechService {
     );
 
     if (_ttsProvider == TTSProvider.flutterTTS) {
+      // Flutter TTS has its own completion handler set during initialization
       await _flutterTts.speak(text);
     } else {
       // Use ElevenLabs for more natural voice
       try {
-        // Use streaming audio for faster playback
+        debugPrint(
+          'Using ElevenLabs for speech with text length: ${text.length}',
+        );
+
+        // Use non-streaming API for more reliable playback
         await _elevenLabsService.synthesizeAndStreamAudio(text);
 
-        // We need to update our state when playback completes
+        // Monitor playback completion with more robust approach
+        bool timerActive = true;
+
+        // Set up a timer that continues until playback is complete
         Timer.periodic(const Duration(milliseconds: 500), (timer) {
-          if (!_elevenLabsService.isPlaying) {
+          if (!_elevenLabsService.isPlaying && timerActive) {
+            debugPrint('ElevenLabs playback detected as completed');
             _isSpeaking = false;
             _updateState(SpeechServiceState.idle);
+            timerActive = false;
             timer.cancel();
+          }
+        });
+
+        // Safety timeout - if playback doesn't complete in 60 seconds, force it to complete
+        Future.delayed(Duration(seconds: 60), () {
+          if (timerActive) {
+            debugPrint('Safety timeout: forcing playback completion');
+            timerActive = false;
+            _isSpeaking = false;
+            _updateState(SpeechServiceState.idle);
           }
         });
       } catch (e) {
         debugPrint('Error using ElevenLabs: $e');
         debugPrint('Falling back to Flutter TTS');
+
+        // Clear the speaking state since there was an error
+        _isSpeaking = false;
+        _updateState(SpeechServiceState.idle);
+
+        // Wait a moment to ensure states are properly reset
+        await Future.delayed(Duration(milliseconds: 500));
+
         // Fall back to Flutter TTS if ElevenLabs fails
+        _isSpeaking = true;
+        _updateState(SpeechServiceState.speaking);
         await _flutterTts.speak(text);
       }
     }

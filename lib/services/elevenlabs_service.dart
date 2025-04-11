@@ -46,6 +46,16 @@ class ElevenLabsService {
         _isPlaying = false;
       }
     });
+
+    // Initialize audio player without preloading
+    try {
+      await _audioPlayer.setAudioSource(
+        AudioSource.uri(Uri.parse('about:blank')),
+      );
+    } catch (e) {
+      debugPrint('Error initializing audio player: $e');
+      // Continue without preloading if there's an error
+    }
   }
 
   /// Synthesize speech using ElevenLabs API and play the result
@@ -127,106 +137,49 @@ class ElevenLabsService {
         );
       }
 
-      // Use streaming endpoint for faster audio playback
+      // Start the API request in parallel with audio player setup
       final url = Uri.parse(
-        '${Config.elevenLabsBaseUrl}/text-to-speech/$_voiceId/stream',
+        '${Config.elevenLabsBaseUrl}/text-to-speech/$_voiceId',
       );
-      debugPrint('ElevenLabs: Making streaming request to: $url');
 
-      final client = HttpClient();
-      final request = await client.postUrl(url);
+      // Create a temporary file path
+      final tempDir = await getTemporaryDirectory();
+      final file = File('${tempDir.path}/elevenlabs_audio.mp3');
 
-      // Add request headers
-      request.headers.set('Content-Type', 'application/json');
-      request.headers.set('xi-api-key', apiKey);
-
-      // Prepare request body
-      final requestBody = jsonEncode({
-        'text': text,
-        'model_id': _modelId,
-        'voice_settings': {'stability': 0.5, 'similarity_boost': 0.75},
-        'output_format': 'mp3_44100_128',
-      });
-
-      request.write(requestBody);
-      final response = await request.close();
+      // Make the API request
+      final response = await http.post(
+        url,
+        headers: {'Content-Type': 'application/json', 'xi-api-key': apiKey},
+        body: jsonEncode({
+          'text': text,
+          'model_id': _modelId,
+          'voice_settings': {'stability': 0.5, 'similarity_boost': 0.75},
+        }),
+      );
 
       if (response.statusCode == 200) {
-        debugPrint('ElevenLabs: Successfully receiving streaming audio');
+        // Write the audio file
+        await file.writeAsBytes(response.bodyBytes);
 
-        // Create a temporary file to store the audio stream
-        final tempDir = await getTemporaryDirectory();
-        final file = File('${tempDir.path}/elevenlabs_stream.mp3');
-        final IOSink sink = file.openWrite();
+        // Set up the audio player in parallel
+        await _audioPlayer.setAudioSource(
+          AudioSource.uri(Uri.file(file.path)),
+          preload: true,
+        );
 
-        // Start buffering the audio stream
-        try {
-          bool hasStartedPlaying = false;
-          int bytesReceived = 0;
-
-          // Buffer size - start playback after receiving this many bytes
-          const playbackStartBufferSize = 32 * 1024; // 32KB initial buffer
-
-          // Process the streaming response
-          await for (List<int> chunk in response) {
-            // Write this chunk to the file
-            sink.add(chunk);
-            bytesReceived += chunk.length;
-
-            // Start playback once we have enough data
-            if (!hasStartedPlaying &&
-                bytesReceived >= playbackStartBufferSize) {
-              debugPrint(
-                'ElevenLabs: Starting playback while streaming ($bytesReceived bytes received)',
-              );
-              hasStartedPlaying = true;
-
-              // Start playing from the file while it's still being written
-              // Need to close and reopen file to flush buffers
-              await sink.flush();
-
-              // Play the audio file that's still being written
-              await _audioPlayer.setFilePath(file.path);
-              await _audioPlayer.play();
-            }
-          }
-
-          // If we haven't started playing yet (short audio), play now
-          if (!hasStartedPlaying) {
-            await sink.flush();
-            await sink.close();
-
-            debugPrint(
-              'ElevenLabs: Starting playback after full download ($bytesReceived bytes)',
-            );
-            await _audioPlayer.setFilePath(file.path);
-            await _audioPlayer.play();
-          }
-        } finally {
-          await sink.flush();
-          await sink.close();
-        }
+        // Start playback immediately
+        await _audioPlayer.play();
+        debugPrint('ElevenLabs: Started playing audio');
       } else {
-        debugPrint('ElevenLabs Streaming API Error: ${response.statusCode}');
-
-        // Fallback to non-streaming approach
-        debugPrint('ElevenLabs: Falling back to non-streaming API');
-        await synthesizeAndPlay(text);
+        debugPrint('ElevenLabs API Error: ${response.statusCode}');
+        debugPrint('Error body: ${response.body}');
+        _isPlaying = false;
+        throw Exception('ElevenLabs API error: ${response.statusCode}');
       }
     } catch (e) {
-      debugPrint('ElevenLabs streaming error: $e');
+      debugPrint('ElevenLabs synthesis error: $e');
       _isPlaying = false;
-
-      // Try fallback to non-streaming method
-      try {
-        debugPrint(
-          'ElevenLabs: Falling back to non-streaming API due to error',
-        );
-        await synthesizeAndPlay(text);
-      } catch (fallbackError) {
-        // If fallback also fails, just rethrow the original error
-        rethrow;
-      }
+      rethrow;
     }
   }
 
