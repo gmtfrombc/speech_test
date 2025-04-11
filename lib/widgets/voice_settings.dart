@@ -61,19 +61,31 @@ class _VoiceSettingsState extends State<VoiceSettings> {
       final chatProvider = Provider.of<ChatProvider>(context, listen: false);
       final models = await chatProvider.getAvailableModels();
 
+      // Set default model ID
+      _selectedModelId = 'eleven_flash_v2_5';
+
       setState(() {
-        _availableModels = models;
-        // Default to the user's preferred model
-        _selectedModelId = 'eleven_flash_v2_5';
+        // If we got models from the API, use them
+        if (models.isNotEmpty) {
+          _availableModels = models;
 
-        // If the preferred model exists in the list, select it
-        final preferredModelExists = models.any(
-          (model) => model['model_id'] == _selectedModelId,
-        );
+          // Check if our preferred model exists in the list
+          final preferredModelExists = models.any(
+            (model) => model['model_id'] == _selectedModelId,
+          );
 
-        // If not found, select the first one
-        if (!preferredModelExists && models.isNotEmpty) {
-          _selectedModelId = models.first['model_id'];
+          // If not found, select the first one
+          if (!preferredModelExists) {
+            _selectedModelId = models.first['model_id'];
+          }
+        } else {
+          // If no models returned from API, create a default model entry
+          _availableModels = [
+            {
+              'model_id': 'eleven_flash_v2_5',
+              'name': 'Eleven Flash V2.5 (Default)',
+            },
+          ];
         }
 
         // Set the model in the provider
@@ -84,6 +96,23 @@ class _VoiceSettingsState extends State<VoiceSettings> {
       });
     } catch (e) {
       debugPrint('Error loading models: $e');
+
+      setState(() {
+        // Create a default model entry on error
+        _availableModels = [
+          {
+            'model_id': 'eleven_flash_v2_5',
+            'name': 'Eleven Flash V2.5 (Default)',
+          },
+        ];
+        _selectedModelId = 'eleven_flash_v2_5';
+
+        // Set the default model
+        Provider.of<ChatProvider>(
+          context,
+          listen: false,
+        ).setElevenLabsModel(_selectedModelId!);
+      });
     } finally {
       setState(() {
         _isLoadingModels = false;

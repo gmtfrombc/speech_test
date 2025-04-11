@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:http/http.dart' as http;
+import 'dart:io';
 import '../config.dart';
 import '../models/message.dart';
 import 'elevenlabs_service.dart';
@@ -93,13 +94,43 @@ class SpeechService {
     _updateState(SpeechServiceState.listening);
     _isListening = true;
 
+    // Create a placeholder message for partial results
+    Message? partialMessage;
+
     await _speechToText.listen(
       onResult: (result) {
-        if (result.finalResult) {
-          final text = result.recognizedWords;
-          _speechController.add(text);
+        final text = result.recognizedWords;
 
-          // Add user message to history
+        if (text.isEmpty) return;
+
+        // Always send the current recognition text to the speech controller
+        _speechController.add(text);
+
+        if (!result.finalResult) {
+          // Handle partial result for real-time feedback
+          debugPrint('Partial speech result: $text');
+
+          // Update or create partial message
+          if (partialMessage == null) {
+            partialMessage = Message(
+              content: text,
+              isUser: true,
+              isPartial: true,
+            );
+            _messages.add(partialMessage!);
+            _messagesController.add(partialMessage!);
+          } else {
+            // Update existing partial message
+            partialMessage!.content = text;
+            _messagesController.add(partialMessage!);
+          }
+        } else {
+          // Final result - remove partial message if it exists
+          if (partialMessage != null) {
+            _messages.remove(partialMessage);
+          }
+
+          // Add final user message to history
           final message = Message(content: text, isUser: true);
           _messages.add(message);
           _messagesController.add(message);
@@ -112,6 +143,7 @@ class SpeechService {
       listenFor: const Duration(seconds: 15),
       pauseFor: const Duration(seconds: 3),
       localeId: 'en_US',
+      listenMode: ListenMode.dictation, // Better for continuous speech
     );
   }
 
@@ -131,7 +163,117 @@ class SpeechService {
   Future<void> _getAIResponse() async {
     _updateState(SpeechServiceState.processing);
 
+    // Try using streaming response
+    await _getStreamingAIResponse();
+  }
+
+  // Get streaming AI response using SSE
+  Future<void> _getStreamingAIResponse() async {
     try {
+      // Prepare messages for API call
+      final List<Map<String, dynamic>> formattedMessages =
+          _messages.map((msg) => msg.toJson()).toList();
+
+      // Remove any partial messages before sending
+      formattedMessages.removeWhere(
+        (msg) => msg['content'].isEmpty || msg['content'] == null,
+      );
+
+      // Create placeholder message for streaming responses
+      final pendingMessage = Message(
+        content: "",
+        isUser: false,
+        isPartial: true,
+      );
+      _messages.add(pendingMessage);
+      _messagesController.add(pendingMessage);
+
+      debugPrint('Starting streaming OpenAI request');
+
+      // Use HTTP client with streaming capability
+      final client = HttpClient();
+      final request = await client.postUrl(Uri.parse(Config.openAiChatUrl));
+
+      // Add request headers
+      request.headers.set('Content-Type', 'application/json');
+      request.headers.set('Authorization', 'Bearer ${Config.openAiApiKey}');
+
+      // Prepare request body with streaming flag
+      final requestBody = jsonEncode({
+        'model': 'gpt-4',
+        'messages': formattedMessages,
+        'stream': true,
+      });
+
+      request.write(requestBody);
+      final response = await request.close();
+
+      if (response.statusCode == 200) {
+        debugPrint('Receiving OpenAI streaming response');
+
+        String fullContent = "";
+
+        // Process the streaming response
+        await for (var data in response.transform(utf8.decoder)) {
+          // Handle SSE format (each line starts with "data: ")
+          final lines = data.split('\n');
+
+          for (var line in lines) {
+            if (line.startsWith('data: ') && line != 'data: [DONE]') {
+              try {
+                // Extract the actual JSON data part
+                final jsonData = line.substring(6);
+
+                // Parse the JSON response
+                final Map<String, dynamic> chunk = jsonDecode(jsonData);
+
+                // Extract incremental text (delta)
+                final delta = chunk['choices'][0]['delta']['content'] ?? '';
+                fullContent += delta;
+
+                // Update our pending message with accumulated content
+                pendingMessage.content = fullContent;
+                _messagesController.add(pendingMessage);
+              } catch (e) {
+                debugPrint('Error parsing chunk: $e');
+              }
+            } else if (line == 'data: [DONE]') {
+              // Stream finished
+              debugPrint('OpenAI stream completed');
+              break;
+            }
+          }
+        }
+
+        // Replace the pending message with the final one
+        _messages.remove(pendingMessage);
+        final finalMessage = Message(content: fullContent, isUser: false);
+        _messages.add(finalMessage);
+        _messagesController.add(finalMessage);
+
+        // Speak the response
+        await speak(fullContent);
+      } else {
+        debugPrint('Error: ${response.statusCode}');
+        // Remove pending message on error
+        _messages.remove(pendingMessage);
+        _updateState(SpeechServiceState.idle);
+
+        // Fall back to non-streaming API if streaming fails
+        await _getFallbackAIResponse();
+      }
+    } catch (e) {
+      debugPrint('Error in streaming AI response: $e');
+      // Fall back to regular request
+      await _getFallbackAIResponse();
+    }
+  }
+
+  // Fallback to standard non-streaming API if streaming fails
+  Future<void> _getFallbackAIResponse() async {
+    try {
+      debugPrint('Using fallback non-streaming OpenAI API');
+
       // Prepare messages for API call
       final List<Map<String, dynamic>> formattedMessages =
           _messages.map((msg) => msg.toJson()).toList();
@@ -183,7 +325,8 @@ class SpeechService {
     } else {
       // Use ElevenLabs for more natural voice
       try {
-        await _elevenLabsService.synthesizeAndPlay(text);
+        // Use streaming audio for faster playback
+        await _elevenLabsService.synthesizeAndStreamAudio(text);
 
         // We need to update our state when playback completes
         Timer.periodic(const Duration(milliseconds: 500), (timer) {
